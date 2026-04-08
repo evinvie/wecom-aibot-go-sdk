@@ -3,50 +3,50 @@ package wecomaibot
 import "time"
 
 const (
-	// DefaultWSURL is the production WebSocket endpoint.
+	// DefaultWSURL 生产环境 WebSocket 端点地址。
 	DefaultWSURL = "wss://openws.work.weixin.qq.com"
 
-	// DefaultHeartbeatInterval is the recommended ping interval.
+	// DefaultHeartbeatInterval 推荐的心跳间隔。
 	DefaultHeartbeatInterval = 30 * time.Second
 
-	// DefaultReconnectBaseDelay is the initial back-off delay.
+	// DefaultReconnectBaseDelay 指数退避的初始延迟。
 	DefaultReconnectBaseDelay = 1 * time.Second
 
-	// DefaultReconnectMaxDelay caps the exponential back-off.
+	// DefaultReconnectMaxDelay 指数退避的延迟上限。
 	DefaultReconnectMaxDelay = 30 * time.Second
 
-	// DefaultMaxReconnectAttempts limits retries; -1 means infinite.
+	// DefaultMaxReconnectAttempts 最大重连次数；-1 表示无限重连。
 	DefaultMaxReconnectAttempts = 10
 
-	// DefaultRequestTimeout is the write deadline for a single frame.
+	// DefaultRequestTimeout 单帧写入超时时间。
 	DefaultRequestTimeout = 10 * time.Second
 )
 
-// Options configures a Client.
+// Options 用于配置 Client。
 type Options struct {
-	// Required: the bot credentials.
+	// 必填：机器人凭证。
 	BotID  string
 	Secret string
 
-	// WebSocket endpoint. Defaults to DefaultWSURL.
+	// WebSocket 端点地址，默认为 DefaultWSURL。
 	WSURL string
 
-	// Heartbeat interval. Defaults to 30 s.
+	// 心跳间隔，默认 30 秒。
 	HeartbeatInterval time.Duration
 
-	// Reconnection back-off parameters.
+	// 重连退避参数。
 	ReconnectBaseDelay   time.Duration
 	ReconnectMaxDelay    time.Duration
-	MaxReconnectAttempts int // -1 = infinite
+	MaxReconnectAttempts int // -1 = 无限重连
 
-	// Per-frame write timeout.
+	// 单帧写入超时。
 	RequestTimeout time.Duration
 
-	// Logger instance; nil means the default stderr logger.
+	// 日志实例；nil 使用默认 stderr 日志。
 	Logger Logger
 }
 
-// withDefaults fills zero-valued fields with sensible defaults.
+// withDefaults 为零值字段填充合理的默认值。
 func (o Options) withDefaults() Options {
 	if o.WSURL == "" {
 		o.WSURL = DefaultWSURL

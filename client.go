@@ -13,7 +13,7 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// Client manages the WebSocket connection, authentication, heartbeat, and message dispatch.
+// Client 管理 WebSocket 连接、认证、心跳和消息分发。
 type Client struct {
 	opts      Options
 	log       Logger
@@ -25,7 +25,7 @@ type Client struct {
 	pending   sync.Map // req_id -> chan *Frame
 }
 
-// NewClient creates a new SDK client.
+// NewClient 创建一个新的 SDK 客户端。
 func NewClient(opts Options) *Client {
 	opts = opts.withDefaults()
 	return &Client{
@@ -35,28 +35,29 @@ func NewClient(opts Options) *Client {
 	}
 }
 
-// On registers an event handler. See event.go for event name constants.
+// On 注册事件处理函数。事件名称常量定义在 event.go 中。
 func (c *Client) On(event string, h Handler) func() { return c.emitter.On(event, h) }
 
-// IsConnected reports whether the WebSocket is currently connected.
+// IsConnected 返回当前 WebSocket 是否已连接。
 func (c *Client) IsConnected() bool { return c.connected.Load() }
 
-// GenerateReqID produces a unique request ID.
+// GenerateReqID 生成唯一的请求 ID。
 func GenerateReqID(prefix string) string {
 	return prefix + "_" + uuid.New().String()[:8]
 }
 
 // ---------------------------------------------------------------------------
-// Connection lifecycle
+// 连接生命周期
 // ---------------------------------------------------------------------------
 
-// Run connects and blocks until ctx is cancelled. It handles reconnection automatically.
+// Run 建立连接并阻塞直到 ctx 被取消。自动处理断线重连。
 func (c *Client) Run(ctx context.Context) error {
 	c.stopCh = make(chan struct{})
 	defer close(c.stopCh)
 	return c.connectWithRetry(ctx)
 }
 
+// connectWithRetry 带重连的连接循环。
 func (c *Client) connectWithRetry(ctx context.Context) error {
 	var attempt int
 	for {
@@ -64,7 +65,7 @@ func (c *Client) connectWithRetry(ctx context.Context) error {
 		c.connected.Store(false)
 		c.emitter.Emit(EventNameDisconnected, nil, nil)
 		if err != nil {
-			c.log.Error("connection lost: %v", err)
+			c.log.Error("连接断开: %v", err)
 		}
 
 		if ctx.Err() != nil {
@@ -72,11 +73,11 @@ func (c *Client) connectWithRetry(ctx context.Context) error {
 		}
 		attempt++
 		if c.opts.MaxReconnectAttempts > 0 && attempt > c.opts.MaxReconnectAttempts {
-			return fmt.Errorf("max reconnect attempts (%d) exceeded", c.opts.MaxReconnectAttempts)
+			return fmt.Errorf("超过最大重连次数 (%d)", c.opts.MaxReconnectAttempts)
 		}
 
 		delay := c.backoff(attempt)
-		c.log.Info("reconnecting in %v (attempt %d)", delay, attempt)
+		c.log.Info("将在 %v 后重连 (第 %d 次)", delay, attempt)
 		c.emitter.Emit(EventNameReconnecting, nil, attempt)
 
 		select {
@@ -87,11 +88,12 @@ func (c *Client) connectWithRetry(ctx context.Context) error {
 	}
 }
 
+// connect 执行一次完整的连接流程：拨号 → 认证 → 心跳 → 读取循环。
 func (c *Client) connect(ctx context.Context) error {
 	dialer := websocket.DefaultDialer
 	conn, _, err := dialer.DialContext(ctx, c.opts.WSURL, nil)
 	if err != nil {
-		return fmt.Errorf("dial: %w", err)
+		return fmt.Errorf("拨号失败: %w", err)
 	}
 	c.connMu.Lock()
 	c.conn = conn
@@ -99,41 +101,43 @@ func (c *Client) connect(ctx context.Context) error {
 
 	c.connected.Store(true)
 	c.emitter.Emit(EventNameConnected, nil, nil)
-	c.log.Info("connected to %s", c.opts.WSURL)
+	c.log.Info("已连接到 %s", c.opts.WSURL)
 
-	// Authenticate
+	// 认证
 	if err := c.authenticate(); err != nil {
 		conn.Close()
 		return err
 	}
 
-	// Start heartbeat
+	// 启动心跳
 	heartCtx, heartCancel := context.WithCancel(ctx)
 	defer heartCancel()
 	go c.heartbeatLoop(heartCtx)
 
-	// Read loop (blocks until error)
+	// 读取循环（阻塞直到出错）
 	return c.readLoop(ctx)
 }
 
+// authenticate 发送订阅请求完成身份认证。
 func (c *Client) authenticate() error {
 	body := map[string]string{"bot_id": c.opts.BotID, "secret": c.opts.Secret}
 	resp, err := c.Send(CmdSubscribe, body)
 	if err != nil {
-		return fmt.Errorf("subscribe send: %w", err)
+		return fmt.Errorf("订阅请求发送失败: %w", err)
 	}
 	if resp.ErrCode != 0 {
-		return fmt.Errorf("subscribe rejected: %d %s", resp.ErrCode, resp.ErrMsg)
+		return fmt.Errorf("订阅被拒绝: %d %s", resp.ErrCode, resp.ErrMsg)
 	}
-	c.log.Info("authenticated (bot_id=%s)", c.opts.BotID)
+	c.log.Info("认证成功 (bot_id=%s)", c.opts.BotID)
 	c.emitter.Emit(EventNameAuthenticated, nil, nil)
 	return nil
 }
 
 // ---------------------------------------------------------------------------
-// Heartbeat
+// 心跳保活
 // ---------------------------------------------------------------------------
 
+// heartbeatLoop 定期发送心跳帧。
 func (c *Client) heartbeatLoop(ctx context.Context) {
 	ticker := time.NewTicker(c.opts.HeartbeatInterval)
 	defer ticker.Stop()
@@ -143,16 +147,17 @@ func (c *Client) heartbeatLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			if _, err := c.Send(CmdPing, nil); err != nil {
-				c.log.Warn("heartbeat failed: %v", err)
+				c.log.Warn("心跳发送失败: %v", err)
 			}
 		}
 	}
 }
 
 // ---------------------------------------------------------------------------
-// Read loop & dispatch
+// 读取循环与消息分发
 // ---------------------------------------------------------------------------
 
+// readLoop 持续读取 WebSocket 消息并进行分发。
 func (c *Client) readLoop(ctx context.Context) error {
 	for {
 		if ctx.Err() != nil {
@@ -160,30 +165,31 @@ func (c *Client) readLoop(ctx context.Context) error {
 		}
 		_, msg, err := c.conn.ReadMessage()
 		if err != nil {
-			return fmt.Errorf("read: %w", err)
+			return fmt.Errorf("读取消息失败: %w", err)
 		}
 		var frame Frame
 		if err := json.Unmarshal(msg, &frame); err != nil {
-			c.log.Warn("unmarshal frame: %v", err)
+			c.log.Warn("帧解析失败: %v", err)
 			continue
 		}
 
-		// Check if this is a response to a pending request.
+		// 检查是否是待处理请求的响应
 		if ch, ok := c.pending.LoadAndDelete(frame.Headers.ReqID); ok {
 			ch.(chan *Frame) <- &frame
 			continue
 		}
 
-		// Dispatch callbacks.
+		// 异步分发回调
 		go c.dispatch(&frame)
 	}
 }
 
+// dispatch 根据命令类型分发帧到对应的事件处理函数。
 func (c *Client) dispatch(frame *Frame) {
 	defer func() {
 		if r := recover(); r != nil {
-			c.log.Error("handler panic: %v", r)
-			c.emitter.Emit(EventNameError, frame, fmt.Errorf("handler panic: %v", r))
+			c.log.Error("处理函数发生 panic: %v", r)
+			c.emitter.Emit(EventNameError, frame, fmt.Errorf("处理函数 panic: %v", r))
 		}
 	}()
 
@@ -191,7 +197,7 @@ func (c *Client) dispatch(frame *Frame) {
 	case CmdMsgCallback:
 		var body MsgCallbackBody
 		if err := json.Unmarshal(frame.Body, &body); err != nil {
-			c.log.Warn("unmarshal msg callback: %v", err)
+			c.log.Warn("消息回调解析失败: %v", err)
 			return
 		}
 		c.emitter.Emit(EventNameMessage, frame, &body)
@@ -213,7 +219,7 @@ func (c *Client) dispatch(frame *Frame) {
 	case CmdEventCallback:
 		var body EventCallbackBody
 		if err := json.Unmarshal(frame.Body, &body); err != nil {
-			c.log.Warn("unmarshal event callback: %v", err)
+			c.log.Warn("事件回调解析失败: %v", err)
 			return
 		}
 		c.emitter.Emit(EventNameEvent, frame, &body)
@@ -229,10 +235,10 @@ func (c *Client) dispatch(frame *Frame) {
 }
 
 // ---------------------------------------------------------------------------
-// Send / Reply helpers
+// 发送与回复
 // ---------------------------------------------------------------------------
 
-// Send writes a frame and waits for the server response matching the req_id.
+// Send 发送一个帧并等待服务端响应（通过 req_id 匹配）。
 func (c *Client) Send(cmd string, body any) (*Frame, error) {
 	reqID := GenerateReqID(cmd)
 
@@ -241,7 +247,7 @@ func (c *Client) Send(cmd string, body any) (*Frame, error) {
 		var err error
 		raw, err = json.Marshal(body)
 		if err != nil {
-			return nil, fmt.Errorf("marshal body: %w", err)
+			return nil, fmt.Errorf("序列化消息体失败: %w", err)
 		}
 	}
 
@@ -252,7 +258,7 @@ func (c *Client) Send(cmd string, body any) (*Frame, error) {
 	}
 	data, err := json.Marshal(frame)
 	if err != nil {
-		return nil, fmt.Errorf("marshal frame: %w", err)
+		return nil, fmt.Errorf("序列化帧失败: %w", err)
 	}
 
 	ch := make(chan *Frame, 1)
@@ -263,7 +269,7 @@ func (c *Client) Send(cmd string, body any) (*Frame, error) {
 	c.connMu.Unlock()
 	if writeErr != nil {
 		c.pending.Delete(reqID)
-		return nil, fmt.Errorf("write: %w", writeErr)
+		return nil, fmt.Errorf("写入失败: %w", writeErr)
 	}
 
 	select {
@@ -271,32 +277,32 @@ func (c *Client) Send(cmd string, body any) (*Frame, error) {
 		return resp, nil
 	case <-time.After(c.opts.RequestTimeout):
 		c.pending.Delete(reqID)
-		return nil, fmt.Errorf("timeout waiting for response to %s", reqID)
+		return nil, fmt.Errorf("等待 %s 的响应超时", reqID)
 	}
 }
 
-// sendReply is a fire-and-forget helper that uses the callback's req_id.
+// sendReply 使用回调帧的 req_id 发送回复（不等待响应）。
 func (c *Client) sendReply(cmd, reqID string, body any) error {
 	raw, err := json.Marshal(body)
 	if err != nil {
-		return fmt.Errorf("marshal body: %w", err)
+		return fmt.Errorf("序列化消息体失败: %w", err)
 	}
 	frame := Frame{Cmd: cmd, Headers: Headers{ReqID: reqID}, Body: raw}
 	data, err := json.Marshal(frame)
 	if err != nil {
-		return fmt.Errorf("marshal frame: %w", err)
+		return fmt.Errorf("序列化帧失败: %w", err)
 	}
 	c.connMu.Lock()
 	defer c.connMu.Unlock()
 	return c.conn.WriteMessage(websocket.TextMessage, data)
 }
 
-// Reply sends a generic reply to a callback frame.
+// Reply 向回调帧发送通用回复。
 func (c *Client) Reply(callbackFrame *Frame, body *ReplyBody) error {
 	return c.sendReply(CmdRespondMsg, callbackFrame.Headers.ReqID, body)
 }
 
-// ReplyText is a convenience method for plain text replies.
+// ReplyText 回复纯文本消息的便捷方法。
 func (c *Client) ReplyText(callbackFrame *Frame, content string) error {
 	return c.Reply(callbackFrame, &ReplyBody{
 		MsgType: MsgTypeText,
@@ -304,15 +310,15 @@ func (c *Client) ReplyText(callbackFrame *Frame, content string) error {
 	})
 }
 
-// ReplyMarkdown sends a Markdown-formatted reply.
+// ReplyMarkdown 回复 Markdown 格式消息。
 func (c *Client) ReplyMarkdown(callbackFrame *Frame, content string) error {
 	return c.Reply(callbackFrame, &ReplyBody{
-		MsgType: MsgTypeMarkdown,
+		MsgType:  MsgTypeMarkdown,
 		Markdown: &MarkdownContent{Content: content},
 	})
 }
 
-// ReplyStream sends or updates a streaming message. Set finish=true to end.
+// ReplyStream 发送或更新流式消息。设置 finish=true 结束流式输出。
 func (c *Client) ReplyStream(callbackFrame *Frame, streamID, content string, finish bool) error {
 	return c.Reply(callbackFrame, &ReplyBody{
 		MsgType: MsgTypeStream,
@@ -320,7 +326,7 @@ func (c *Client) ReplyStream(callbackFrame *Frame, streamID, content string, fin
 	})
 }
 
-// ReplyTemplateCard sends a template card reply.
+// ReplyTemplateCard 回复模板卡片消息。
 func (c *Client) ReplyTemplateCard(callbackFrame *Frame, card *TemplateCard) error {
 	return c.Reply(callbackFrame, &ReplyBody{
 		MsgType:      MsgTypeCard,
@@ -328,12 +334,12 @@ func (c *Client) ReplyTemplateCard(callbackFrame *Frame, card *TemplateCard) err
 	})
 }
 
-// ReplyWelcome sends a welcome message in response to an enter_chat event (within 5s).
+// ReplyWelcome 发送欢迎语（需在收到 enter_chat 事件后 5 秒内调用）。
 func (c *Client) ReplyWelcome(callbackFrame *Frame, body *ReplyBody) error {
 	return c.sendReply(CmdRespondWelcomeMsg, callbackFrame.Headers.ReqID, body)
 }
 
-// UpdateTemplateCard updates an existing card in response to a card click event (within 5s).
+// UpdateTemplateCard 更新已有的模板卡片（需在收到卡片点击事件后 5 秒内调用）。
 func (c *Client) UpdateTemplateCard(callbackFrame *Frame, card *TemplateCard) error {
 	return c.sendReply(CmdRespondUpdateMsg, callbackFrame.Headers.ReqID, &UpdateCardBody{
 		ResponseType: "update_template_card",
@@ -341,13 +347,13 @@ func (c *Client) UpdateTemplateCard(callbackFrame *Frame, card *TemplateCard) er
 	})
 }
 
-// SendMessage proactively pushes a message to a conversation.
+// SendMessage 主动向会话推送消息。
 func (c *Client) SendMessage(body *SendMsgBody) error {
 	_, err := c.Send(CmdSendMsg, body)
 	return err
 }
 
-// SendMarkdown is a convenience for pushing a Markdown message.
+// SendMarkdown 主动推送 Markdown 消息的便捷方法。
 func (c *Client) SendMarkdown(chatID string, chatType ChatTypeInt, content string) error {
 	return c.SendMessage(&SendMsgBody{
 		ChatID: chatID, ChatType: chatType,
@@ -356,7 +362,7 @@ func (c *Client) SendMarkdown(chatID string, chatType ChatTypeInt, content strin
 	})
 }
 
-// Disconnect gracefully closes the connection.
+// Disconnect 优雅地关闭 WebSocket 连接。
 func (c *Client) Disconnect() error {
 	c.connMu.Lock()
 	defer c.connMu.Unlock()
@@ -366,7 +372,7 @@ func (c *Client) Disconnect() error {
 	return nil
 }
 
-// backoff calculates exponential back-off with a cap.
+// backoff 计算指数退避延迟（带上限）。
 func (c *Client) backoff(attempt int) time.Duration {
 	d := c.opts.ReconnectBaseDelay * time.Duration(math.Pow(2, float64(attempt-1)))
 	if d > c.opts.ReconnectMaxDelay {

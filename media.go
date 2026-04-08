@@ -15,18 +15,19 @@ import (
 	"path/filepath"
 )
 
-const chunkSize = 512 * 1024 // 512 KB per chunk
+const chunkSize = 512 * 1024 // 每个分片 512 KB
 
-// DownloadFile fetches a media URL and decrypts it with AES-256-CBC if aesKey is provided.
+// DownloadFile 下载媒体文件，若提供 aesKey 则使用 AES-256-CBC 解密。
+// 返回文件内容、文件名和错误。
 func DownloadFile(url, aesKey string) ([]byte, string, error) {
 	resp, err := http.Get(url)
 	if err != nil {
-		return nil, "", fmt.Errorf("download: %w", err)
+		return nil, "", fmt.Errorf("下载失败: %w", err)
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, "", fmt.Errorf("read body: %w", err)
+		return nil, "", fmt.Errorf("读取响应体失败: %w", err)
 	}
 	filename := filepath.Base(resp.Request.URL.Path)
 	if aesKey == "" {
@@ -34,11 +35,11 @@ func DownloadFile(url, aesKey string) ([]byte, string, error) {
 	}
 	key, err := base64.StdEncoding.DecodeString(aesKey)
 	if err != nil {
-		return nil, "", fmt.Errorf("decode aes key: %w", err)
+		return nil, "", fmt.Errorf("解码 AES 密钥失败: %w", err)
 	}
 	block, err := aes.NewCipher(key)
 	if err != nil {
-		return nil, "", fmt.Errorf("aes cipher: %w", err)
+		return nil, "", fmt.Errorf("创建 AES 密码器失败: %w", err)
 	}
 	iv := key[:aes.BlockSize]
 	mode := cipher.NewCBCDecrypter(block, iv)
@@ -47,6 +48,7 @@ func DownloadFile(url, aesKey string) ([]byte, string, error) {
 	return data, filename, nil
 }
 
+// pkcs7Unpad 移除 PKCS#7 填充。
 func pkcs7Unpad(data []byte) []byte {
 	if len(data) == 0 {
 		return data
@@ -58,28 +60,28 @@ func pkcs7Unpad(data []byte) []byte {
 	return data[:len(data)-pad]
 }
 
-// UploadFile reads a local file and uploads it via the 3-step chunked upload API.
+// UploadFile 读取本地文件并通过三步分片上传 API 上传，返回 media_id。
 func (c *Client) UploadFile(mediaType, filePath string) (string, error) {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
-		return "", fmt.Errorf("read file: %w", err)
+		return "", fmt.Errorf("读取文件失败: %w", err)
 	}
 	filename := filepath.Base(filePath)
 	totalChunks := int(math.Ceil(float64(len(data)) / float64(chunkSize)))
 	hash := md5.Sum(data)
 	md5Hex := hex.EncodeToString(hash[:])
 
-	// Step 1: init
+	// 第一步：初始化上传
 	initBody := UploadInitBody{
 		Type: mediaType, Filename: filename,
 		TotalSize: int64(len(data)), TotalChunks: totalChunks, MD5: md5Hex,
 	}
 	initResp, err := sendAndWait[UploadInitResp](c, CmdUploadMediaInit, initBody)
 	if err != nil {
-		return "", fmt.Errorf("upload init: %w", err)
+		return "", fmt.Errorf("上传初始化失败: %w", err)
 	}
 
-	// Step 2: chunks
+	// 第二步：逐个上传分片
 	for i := 0; i < totalChunks; i++ {
 		start := i * chunkSize
 		end := start + chunkSize
@@ -91,31 +93,31 @@ func (c *Client) UploadFile(mediaType, filePath string) (string, error) {
 			Base64Data: base64.StdEncoding.EncodeToString(data[start:end]),
 		}
 		if _, err := sendAndWait[json.RawMessage](c, CmdUploadMediaChunk, chunk); err != nil {
-			return "", fmt.Errorf("upload chunk %d: %w", i, err)
+			return "", fmt.Errorf("上传第 %d 个分片失败: %w", i, err)
 		}
 	}
 
-	// Step 3: finish
+	// 第三步：完成上传
 	finishResp, err := sendAndWait[UploadFinishResp](c, CmdUploadMediaFinish, UploadFinishBody{UploadID: initResp.UploadID})
 	if err != nil {
-		return "", fmt.Errorf("upload finish: %w", err)
+		return "", fmt.Errorf("完成上传失败: %w", err)
 	}
 	return finishResp.MediaID, nil
 }
 
-// sendAndWait is a helper that sends a command and parses the response body.
+// sendAndWait 发送命令并解析响应体的泛型辅助函数。
 func sendAndWait[T any](c *Client, cmd string, body any) (*T, error) {
 	respFrame, err := c.Send(cmd, body)
 	if err != nil {
 		return nil, err
 	}
 	if respFrame.ErrCode != 0 {
-		return nil, fmt.Errorf("server error %d: %s", respFrame.ErrCode, respFrame.ErrMsg)
+		return nil, fmt.Errorf("服务端错误 %d: %s", respFrame.ErrCode, respFrame.ErrMsg)
 	}
 	var result T
 	if len(respFrame.Body) > 0 {
 		if err := json.Unmarshal(respFrame.Body, &result); err != nil {
-			return nil, fmt.Errorf("unmarshal response: %w", err)
+			return nil, fmt.Errorf("解析响应失败: %w", err)
 		}
 	}
 	return &result, nil
