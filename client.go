@@ -3,6 +3,7 @@ package wecomaibot
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"sync"
@@ -13,16 +14,27 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// 哨兵错误，用于区分连接关闭的原因。
+var (
+	// ErrConnClosed 表示连接已关闭或不可用。
+	ErrConnClosed = errors.New("wecom-aibot: 连接已关闭")
+
+	// ErrDisconnectedByServer 表示被服务端踢掉（同一 BotID 的新连接建立）。
+	ErrDisconnectedByServer = errors.New("wecom-aibot: 被服务端断开（新连接建立）")
+)
+
 // Client 管理 WebSocket 连接、认证、心跳和消息分发。
 type Client struct {
-	opts      Options
-	log       Logger
-	emitter   *EventEmitter
-	conn      *websocket.Conn
-	connMu    sync.Mutex
-	connected atomic.Bool
-	stopCh    chan struct{}
-	pending   sync.Map // req_id -> chan *Frame
+	opts    Options
+	log     Logger
+	emitter *EventEmitter
+
+	connMu    sync.RWMutex     // 保护 conn 的读写
+	conn      *websocket.Conn  // 当前连接，可能为 nil
+	connected atomic.Bool      // 连接状态标记
+	closeCh   chan struct{}     // 通知读循环退出（收到 disconnected_event 时关闭）
+	stopCh    chan struct{}     // Run 退出时关闭
+	pending   sync.Map         // req_id -> chan *Frame
 }
 
 // NewClient 创建一个新的 SDK 客户端。
@@ -95,6 +107,10 @@ func (c *Client) connect(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("拨号失败: %w", err)
 	}
+
+	// 初始化本轮连接状态
+	c.closeCh = make(chan struct{})
+
 	c.connMu.Lock()
 	c.conn = conn
 	c.connMu.Unlock()
@@ -105,7 +121,7 @@ func (c *Client) connect(ctx context.Context) error {
 
 	// 认证
 	if err := c.authenticate(); err != nil {
-		conn.Close()
+		c.closeConn()
 		return err
 	}
 
@@ -137,8 +153,14 @@ func (c *Client) authenticate() error {
 // 心跳保活
 // ---------------------------------------------------------------------------
 
-// heartbeatLoop 定期发送心跳帧。
+// heartbeatLoop 定期发送心跳帧。内部 goroutine，带 recover 兜底。
 func (c *Client) heartbeatLoop(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			c.log.Error("心跳 goroutine panic: %v", r)
+		}
+	}()
+
 	ticker := time.NewTicker(c.opts.HeartbeatInterval)
 	defer ticker.Stop()
 	for {
@@ -148,6 +170,10 @@ func (c *Client) heartbeatLoop(ctx context.Context) {
 		case <-ticker.C:
 			if _, err := c.Send(CmdPing, nil); err != nil {
 				c.log.Warn("心跳发送失败: %v", err)
+				// 连接已关闭时不需要继续心跳
+				if errors.Is(err, ErrConnClosed) {
+					return
+				}
 			}
 		}
 	}
@@ -160,13 +186,34 @@ func (c *Client) heartbeatLoop(ctx context.Context) {
 // readLoop 持续读取 WebSocket 消息并进行分发。
 func (c *Client) readLoop(ctx context.Context) error {
 	for {
-		if ctx.Err() != nil {
+		// 优先检查退出信号
+		select {
+		case <-ctx.Done():
 			return ctx.Err()
+		case <-c.closeCh:
+			return ErrDisconnectedByServer
+		default:
 		}
-		_, msg, err := c.conn.ReadMessage()
+
+		// 加读锁获取 conn 引用，避免 nil 解引用
+		c.connMu.RLock()
+		conn := c.conn
+		c.connMu.RUnlock()
+		if conn == nil {
+			return ErrConnClosed
+		}
+
+		_, msg, err := conn.ReadMessage()
 		if err != nil {
+			// 判断是否因为被主动关闭
+			select {
+			case <-c.closeCh:
+				return ErrDisconnectedByServer
+			default:
+			}
 			return fmt.Errorf("读取消息失败: %w", err)
 		}
+
 		var frame Frame
 		if err := json.Unmarshal(msg, &frame); err != nil {
 			c.log.Warn("帧解析失败: %v", err)
@@ -179,7 +226,7 @@ func (c *Client) readLoop(ctx context.Context) error {
 			continue
 		}
 
-		// 异步分发回调
+		// 异步分发回调（带 recover）
 		go c.dispatch(&frame)
 	}
 }
@@ -230,6 +277,11 @@ func (c *Client) dispatch(frame *Frame) {
 			c.emitter.Emit(EventNameTemplateCard, frame, &body)
 		case EventFeedback:
 			c.emitter.Emit(EventNameFeedbackEvent, frame, &body)
+		case EventDisconnected:
+			// 被服务端踢下线：先触发事件，再安全关闭连接让读循环退出
+			c.log.Warn("收到服务端断开通知 (disconnected_event)")
+			c.emitter.Emit(EventNameDisconnected, frame, &body)
+			c.closeConn()
 		}
 	}
 }
@@ -237,6 +289,17 @@ func (c *Client) dispatch(frame *Frame) {
 // ---------------------------------------------------------------------------
 // 发送与回复
 // ---------------------------------------------------------------------------
+
+// getConn 安全获取当前连接，若连接不可用返回 ErrConnClosed。
+func (c *Client) getConn() (*websocket.Conn, error) {
+	c.connMu.RLock()
+	conn := c.conn
+	c.connMu.RUnlock()
+	if conn == nil {
+		return nil, ErrConnClosed
+	}
+	return conn, nil
+}
 
 // Send 发送一个帧并等待服务端响应（通过 req_id 匹配）。
 func (c *Client) Send(cmd string, body any) (*Frame, error) {
@@ -263,6 +326,15 @@ func (c *Client) Send(cmd string, body any) (*Frame, error) {
 
 	ch := make(chan *Frame, 1)
 	c.pending.Store(reqID, ch)
+
+	// 加锁写入，同时检查 conn 是否为 nil
+	c.connMu.RLock()
+	conn := c.conn
+	c.connMu.RUnlock()
+	if conn == nil {
+		c.pending.Delete(reqID)
+		return nil, ErrConnClosed
+	}
 
 	c.connMu.Lock()
 	writeErr := c.conn.WriteMessage(websocket.TextMessage, data)
@@ -292,8 +364,19 @@ func (c *Client) sendReply(cmd, reqID string, body any) error {
 	if err != nil {
 		return fmt.Errorf("序列化帧失败: %w", err)
 	}
+
+	c.connMu.RLock()
+	conn := c.conn
+	c.connMu.RUnlock()
+	if conn == nil {
+		return ErrConnClosed
+	}
+
 	c.connMu.Lock()
 	defer c.connMu.Unlock()
+	if c.conn == nil {
+		return ErrConnClosed
+	}
 	return c.conn.WriteMessage(websocket.TextMessage, data)
 }
 
@@ -362,13 +445,46 @@ func (c *Client) SendMarkdown(chatID string, chatType ChatTypeInt, content strin
 	})
 }
 
-// Disconnect 优雅地关闭 WebSocket 连接。
-func (c *Client) Disconnect() error {
+// ---------------------------------------------------------------------------
+// 连接关闭
+// ---------------------------------------------------------------------------
+
+// closeConn 安全关闭当前连接并通知读循环退出。
+// 可被多个 goroutine 安全调用（幂等）。
+func (c *Client) closeConn() {
+	c.connected.Store(false)
+
+	// 通知读循环退出（select on closeCh）
+	select {
+	case <-c.closeCh:
+		// 已经关闭过了
+	default:
+		close(c.closeCh)
+	}
+
 	c.connMu.Lock()
 	defer c.connMu.Unlock()
 	if c.conn != nil {
-		return c.conn.Close()
+		c.conn.Close()
+		c.conn = nil
 	}
+
+	// 清理所有待处理的请求
+	c.pending.Range(func(key, value any) bool {
+		c.pending.Delete(key)
+		ch := value.(chan *Frame)
+		// 发送一个空帧让等待方超时退出而不是永久阻塞
+		select {
+		case ch <- &Frame{ErrCode: -1, ErrMsg: "连接已关闭"}:
+		default:
+		}
+		return true
+	})
+}
+
+// Disconnect 优雅地关闭 WebSocket 连接。
+func (c *Client) Disconnect() error {
+	c.closeConn()
 	return nil
 }
 
