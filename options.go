@@ -37,7 +37,7 @@ type Options struct {
 	// 重连退避参数。
 	ReconnectBaseDelay   time.Duration
 	ReconnectMaxDelay    time.Duration
-	MaxReconnectAttempts int // -1 = 无限重连
+	MaxReconnectAttempts int // >0: 限制重连次数; 0: 使用默认值(10); -1: 无限重连
 
 	// 单帧写入超时。
 	RequestTimeout time.Duration

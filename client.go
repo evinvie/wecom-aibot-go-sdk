@@ -29,7 +29,7 @@ type Client struct {
 	log     Logger
 	emitter *EventEmitter
 
-	connMu    sync.RWMutex     // 保护 conn 的读写
+	connMu    sync.Mutex       // 保护 conn 的读写（统一用互斥锁，避免 TOCTOU 竞态）
 	conn      *websocket.Conn  // 当前连接，可能为 nil
 	connected atomic.Bool      // 连接状态标记
 	closeCh   chan struct{}     // 通知读循环退出（收到 disconnected_event 时关闭）
@@ -75,7 +75,11 @@ func (c *Client) connectWithRetry(ctx context.Context) error {
 	for {
 		err := c.connect(ctx)
 		c.connected.Store(false)
-		c.emitter.Emit(EventNameDisconnected, nil, nil)
+
+		// 只在 dispatch 未触发过 disconnected 事件时才 Emit，避免重复通知用户
+		if !errors.Is(err, ErrDisconnectedByServer) {
+			c.emitter.Emit(EventNameDisconnected, nil, nil)
+		}
 		if err != nil {
 			c.log.Error("连接断开: %v", err)
 		}
@@ -170,7 +174,6 @@ func (c *Client) heartbeatLoop(ctx context.Context) {
 		case <-ticker.C:
 			if _, err := c.Send(CmdPing, nil); err != nil {
 				c.log.Warn("心跳发送失败: %v", err)
-				// 连接已关闭时不需要继续心跳
 				if errors.Is(err, ErrConnClosed) {
 					return
 				}
@@ -195,17 +198,16 @@ func (c *Client) readLoop(ctx context.Context) error {
 		default:
 		}
 
-		// 加读锁获取 conn 引用，避免 nil 解引用
-		c.connMu.RLock()
+		// 加锁获取 conn 引用，避免 nil 解引用
+		c.connMu.Lock()
 		conn := c.conn
-		c.connMu.RUnlock()
+		c.connMu.Unlock()
 		if conn == nil {
 			return ErrConnClosed
 		}
 
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
-			// 判断是否因为被主动关闭
 			select {
 			case <-c.closeCh:
 				return ErrDisconnectedByServer
@@ -290,17 +292,6 @@ func (c *Client) dispatch(frame *Frame) {
 // 发送与回复
 // ---------------------------------------------------------------------------
 
-// getConn 安全获取当前连接，若连接不可用返回 ErrConnClosed。
-func (c *Client) getConn() (*websocket.Conn, error) {
-	c.connMu.RLock()
-	conn := c.conn
-	c.connMu.RUnlock()
-	if conn == nil {
-		return nil, ErrConnClosed
-	}
-	return conn, nil
-}
-
 // Send 发送一个帧并等待服务端响应（通过 req_id 匹配）。
 func (c *Client) Send(cmd string, body any) (*Frame, error) {
 	reqID := GenerateReqID(cmd)
@@ -327,18 +318,16 @@ func (c *Client) Send(cmd string, body any) (*Frame, error) {
 	ch := make(chan *Frame, 1)
 	c.pending.Store(reqID, ch)
 
-	// 加锁写入，同时检查 conn 是否为 nil
-	c.connMu.RLock()
-	conn := c.conn
-	c.connMu.RUnlock()
-	if conn == nil {
+	// 加锁检查 + 写入，原子操作避免 TOCTOU 竞态
+	c.connMu.Lock()
+	if c.conn == nil {
+		c.connMu.Unlock()
 		c.pending.Delete(reqID)
 		return nil, ErrConnClosed
 	}
-
-	c.connMu.Lock()
 	writeErr := c.conn.WriteMessage(websocket.TextMessage, data)
 	c.connMu.Unlock()
+
 	if writeErr != nil {
 		c.pending.Delete(reqID)
 		return nil, fmt.Errorf("写入失败: %w", writeErr)
@@ -365,13 +354,7 @@ func (c *Client) sendReply(cmd, reqID string, body any) error {
 		return fmt.Errorf("序列化帧失败: %w", err)
 	}
 
-	c.connMu.RLock()
-	conn := c.conn
-	c.connMu.RUnlock()
-	if conn == nil {
-		return ErrConnClosed
-	}
-
+	// 加锁检查 + 写入，原子操作
 	c.connMu.Lock()
 	defer c.connMu.Unlock()
 	if c.conn == nil {
@@ -454,7 +437,7 @@ func (c *Client) SendMarkdown(chatID string, chatType ChatTypeInt, content strin
 func (c *Client) closeConn() {
 	c.connected.Store(false)
 
-	// 通知读循环退出（select on closeCh）
+	// 通知读循环退出
 	select {
 	case <-c.closeCh:
 		// 已经关闭过了
@@ -469,11 +452,10 @@ func (c *Client) closeConn() {
 		c.conn = nil
 	}
 
-	// 清理所有待处理的请求
+	// 清理所有待处理的请求，避免 goroutine 泄漏
 	c.pending.Range(func(key, value any) bool {
 		c.pending.Delete(key)
 		ch := value.(chan *Frame)
-		// 发送一个空帧让等待方超时退出而不是永久阻塞
 		select {
 		case ch <- &Frame{ErrCode: -1, ErrMsg: "连接已关闭"}:
 		default:

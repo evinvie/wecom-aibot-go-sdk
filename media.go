@@ -33,19 +33,41 @@ func DownloadFile(url, aesKey string) ([]byte, string, error) {
 	if aesKey == "" {
 		return data, filename, nil
 	}
-	key, err := base64.StdEncoding.DecodeString(aesKey)
+
+	decrypted, err := decryptAES256CBC(data, aesKey)
 	if err != nil {
-		return nil, "", fmt.Errorf("解码 AES 密钥失败: %w", err)
+		return nil, "", err
+	}
+	return decrypted, filename, nil
+}
+
+// decryptAES256CBC 使用 AES-256-CBC 解密数据。
+// 密钥为 Base64 编码，IV 取 decoded key 的前 16 字节。
+func decryptAES256CBC(data []byte, aesKeyBase64 string) ([]byte, error) {
+	key, err := base64.StdEncoding.DecodeString(aesKeyBase64)
+	if err != nil {
+		return nil, fmt.Errorf("解码 AES 密钥失败: %w", err)
+	}
+	// AES-256 要求 key 长度 32 字节，IV 取前 16 字节
+	if len(key) < aes.BlockSize {
+		return nil, fmt.Errorf("AES 密钥长度不足: 需要至少 %d 字节, 实际 %d 字节", aes.BlockSize, len(key))
 	}
 	block, err := aes.NewCipher(key)
 	if err != nil {
-		return nil, "", fmt.Errorf("创建 AES 密码器失败: %w", err)
+		return nil, fmt.Errorf("创建 AES 密码器失败: %w", err)
+	}
+	// CBC 解密要求数据长度是 BlockSize 的倍数
+	if len(data) == 0 || len(data)%aes.BlockSize != 0 {
+		return nil, fmt.Errorf("密文长度无效: %d 不是 %d 的倍数", len(data), aes.BlockSize)
 	}
 	iv := key[:aes.BlockSize]
+	// 创建副本避免修改原始 data
+	decrypted := make([]byte, len(data))
+	copy(decrypted, data)
 	mode := cipher.NewCBCDecrypter(block, iv)
-	mode.CryptBlocks(data, data)
-	data = pkcs7Unpad(data)
-	return data, filename, nil
+	mode.CryptBlocks(decrypted, decrypted)
+	decrypted = pkcs7Unpad(decrypted)
+	return decrypted, nil
 }
 
 // pkcs7Unpad 移除 PKCS#7 填充。
@@ -54,8 +76,14 @@ func pkcs7Unpad(data []byte) []byte {
 		return data
 	}
 	pad := int(data[len(data)-1])
-	if pad > len(data) || pad > aes.BlockSize {
+	if pad == 0 || pad > aes.BlockSize || pad > len(data) {
 		return data
+	}
+	// 验证所有填充字节是否一致
+	for i := len(data) - pad; i < len(data); i++ {
+		if data[i] != byte(pad) {
+			return data // 填充不合法，返回原数据
+		}
 	}
 	return data[:len(data)-pad]
 }
