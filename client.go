@@ -73,8 +73,14 @@ func (c *Client) Run(ctx context.Context) error {
 func (c *Client) connectWithRetry(ctx context.Context) error {
 	var attempt int
 	for {
+		connectedAt := time.Now()
 		err := c.connect(ctx)
 		c.connected.Store(false)
+
+		// 如果这次连接持续了超过 1 分钟，说明之前重连成功过，重置计数器
+		if time.Since(connectedAt) > time.Minute {
+			attempt = 0
+		}
 
 		// 只在 dispatch 未触发过 disconnected 事件时才 Emit，避免重复通知用户
 		if !errors.Is(err, ErrDisconnectedByServer) {
@@ -158,6 +164,7 @@ func (c *Client) authenticate() error {
 // ---------------------------------------------------------------------------
 
 // heartbeatLoop 定期发送心跳帧。内部 goroutine，带 recover 兜底。
+// 心跳使用 fire-and-forget 方式，不等待响应（服务端不一定回复 ping）。
 func (c *Client) heartbeatLoop(ctx context.Context) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -172,7 +179,7 @@ func (c *Client) heartbeatLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if _, err := c.Send(CmdPing, nil); err != nil {
+			if err := c.sendPing(); err != nil {
 				c.log.Warn("心跳发送失败: %v", err)
 				if errors.Is(err, ErrConnClosed) {
 					return
@@ -180,6 +187,24 @@ func (c *Client) heartbeatLoop(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// sendPing 发送心跳帧（fire-and-forget，不等待响应）。
+func (c *Client) sendPing() error {
+	frame := Frame{
+		Cmd:     CmdPing,
+		Headers: Headers{ReqID: GenerateReqID("ping")},
+	}
+	data, err := json.Marshal(frame)
+	if err != nil {
+		return fmt.Errorf("序列化心跳帧失败: %w", err)
+	}
+	c.connMu.Lock()
+	defer c.connMu.Unlock()
+	if c.conn == nil {
+		return ErrConnClosed
+	}
+	return c.conn.WriteMessage(websocket.TextMessage, data)
 }
 
 // ---------------------------------------------------------------------------

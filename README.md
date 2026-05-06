@@ -139,10 +139,20 @@ client.ReplyText(frame, "Hello!")
 // Markdown
 client.ReplyMarkdown(frame, "**加粗** 和 `代码`")
 
-// 流式回复
+// 流式回复（基础方式）
 streamID := wecom.GenerateReqID("stream")
 client.ReplyStream(frame, streamID, "思考中...", false)
 client.ReplyStream(frame, streamID, "最终答案", true)
+
+// 流式回复（推荐：StreamSession 自动防 10 分钟超时）
+stream := client.NewStream(frame)
+stream.Update("正在处理...")        // 发送中间状态
+stream.Update("继续分析...")        // 更新内容
+if stream.IsExpired() {            // 可主动检查是否超时
+    stream.Finish("处理超时，请重试")
+}
+stream.Finish("最终结果")           // 结束流式消息
+// stream.Remaining() 可查看剩余时间
 
 // 模板卡片
 client.ReplyTemplateCard(frame, &wecom.TemplateCard{
