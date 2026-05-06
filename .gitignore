@@ -1,0 +1,31 @@
+# 编译产物
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+wecom-aibot-go-sdk
+
+# 依赖目录
+vendor/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 操作系统
+.DS_Store
+Thumbs.db
+
+# 敏感凭证文件（绝对不能提交！）
+**/bot_id.txt
+**/secret.txt
+**/*.env
+**/.env.local
+**/credentials.*
+**/*.pem
+**/*.key

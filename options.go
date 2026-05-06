@@ -1,6 +1,11 @@
 package wecomaibot
 
-import "time"
+import (
+	"fmt"
+	"os"
+	"strings"
+	"time"
+)
 
 const (
 	// DefaultWSURL 生产环境 WebSocket 端点地址。
@@ -24,9 +29,18 @@ const (
 
 // Options 用于配置 Client。
 type Options struct {
-	// 必填：机器人凭证。
+	// 必填：机器人凭证（二选一设置）。
+	//
+	// 方式一：直接传值（不推荐提交到代码仓库）。
+	// 方式二：使用 SecretFile / BotIDFile 从文件读取（推荐）。
 	BotID  string
 	Secret string
+
+	// 可选：从文件读取凭证（优先级高于直接赋值）。
+	// 文件内容为纯文本，读取后会去除首尾空白。
+	// 推荐：将文件权限设为 600 (仅 owner 可读写)。
+	SecretFile string // 密钥文件路径
+	BotIDFile  string // BotID 文件路径
 
 	// WebSocket 端点地址，默认为 DefaultWSURL。
 	WSURL string
@@ -46,8 +60,8 @@ type Options struct {
 	Logger Logger
 }
 
-// withDefaults 为零值字段填充合理的默认值。
-func (o Options) withDefaults() Options {
+// withDefaults 为零值字段填充合理的默认值，并从文件加载凭证。
+func (o Options) withDefaults() (Options, error) {
 	if o.WSURL == "" {
 		o.WSURL = DefaultWSURL
 	}
@@ -69,5 +83,31 @@ func (o Options) withDefaults() Options {
 	if o.Logger == nil {
 		o.Logger = NewDefaultLogger()
 	}
-	return o
+
+	// 从文件加载凭证（优先级高于直接赋值）
+	if o.BotIDFile != "" {
+		data, err := os.ReadFile(o.BotIDFile)
+		if err != nil {
+			return o, fmt.Errorf("读取 BotID 文件失败 (%s): %w", o.BotIDFile, err)
+		}
+		o.BotID = strings.TrimSpace(string(data))
+	}
+	if o.SecretFile != "" {
+		data, err := os.ReadFile(o.SecretFile)
+		if err != nil {
+			return o, fmt.Errorf("读取 Secret 文件失败 (%s): %w", o.SecretFile, err)
+		}
+		o.Secret = strings.TrimSpace(string(data))
+	}
+
+	return o, nil
+}
+
+// maskSecret 返回 secret 的脱敏形式，仅保留前4位和后4位。
+// 用于日志输出，避免泄露完整密钥。
+func maskSecret(s string) string {
+	if len(s) <= 8 {
+		return "****"
+	}
+	return s[:4] + "****" + s[len(s)-4:]
 }

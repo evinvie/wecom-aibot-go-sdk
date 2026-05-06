@@ -12,10 +12,11 @@
 | **自动认证 & 心跳** | 内置 `aibot_subscribe` + 30s 心跳保活 |
 | **指数退避重连** | 1s → 2s → 4s → ... → 30s，支持自定义最大重试次数 |
 | **事件驱动** | 通过 `client.On(event, handler)` 监听所有消息和事件 |
-| **流式回复** | 支持类 ChatGPT 逐字输出，Markdown 格式 |
+| **流式回复** | 支持类 ChatGPT 逐字输出，Markdown 格式，自动防超时 |
 | **模板卡片** | 发送和更新交互式卡片消息 |
 | **主动推送** | 向指定会话推送 Markdown / 卡片 / 文件等 |
 | **文件处理** | 分片上传（≤512KB/chunk）+ AES-256-CBC 解密下载 |
+| **凭证安全** | 支持从文件读取密钥 + 日志自动脱敏 |
 | **并发安全** | 所有公开方法均可在多 goroutine 中安全调用 |
 
 ## 安装
@@ -43,10 +44,14 @@ import (
 )
 
 func main() {
-    client := wecom.NewClient(wecom.Options{
+    // 推荐方式一：从环境变量读取（适用于容器/CI 环境）
+    client, err := wecom.NewClient(wecom.Options{
         BotID:  os.Getenv("WECHAT_BOT_ID"),
         Secret: os.Getenv("WECHAT_BOT_SECRET"),
     })
+    if err != nil {
+        log.Fatalf("创建客户端失败: %v", err)
+    }
 
     // 认证成功
     client.On(wecom.EventNameAuthenticated, func(_ *wecom.Frame, _ any) {
@@ -86,21 +91,84 @@ func main() {
 }
 ```
 
+## 安全最佳实践 ⚠️
+
+### ❌ 绝对不要做的事
+
+```go
+// 禁止：在代码中硬编码密钥
+client := wecom.NewClient(wecom.Options{
+    BotID:  "aibuDpwikMdj_29wT2CeCpi6f2IHUOALxsp",
+    Secret: "A00labArIGW02gGtErzOPcCNSeU1Fpb3U4CPkP2F48b",
+})
+```
+
+### ✅ 推荐方式
+
+**方式一：从环境变量读取**
+
+```bash
+# .env 文件（不要提交到 Git！）
+export WECHAT_BOT_ID="your_bot_id"
+export WECHAT_BOT_SECRET="your_secret"
+```
+
+```go
+client, _ := wecom.NewClient(wecom.Options{
+    BotID:  os.Getenv("WECHAT_BOT_ID"),
+    Secret: os.Getenv("WECHAT_BOT_SECRET"),
+})
+```
+
+**方式二：从文件读取（更安全）** 🔐
+
+```bash
+# 创建专用目录和凭证文件，设置权限为仅 owner 可读写
+mkdir -p /etc/wecom
+chmod 700 /etc/wecom
+echo -n "your_bot_id" > /etc/wecom/bot_id.txt
+echo -n "your_secret" > /etc/wecom/secret.txt
+chmod 600 /etc/wecom/*.txt
+```
+
+```go
+// SDK 内置支持：通过 SecretFile / BotIDFile 从文件读取
+client, _ := wecom.NewClient(wecom.Options{
+    BotIDFile:  "/etc/wecom/bot_id.txt",
+    SecretFile: "/etc/wecom/secret.txt",
+})
+// 优先级：SecretFile > Secret 字段直接赋值
+```
+
+### 安全检查清单
+
+- [ ] **不要将密钥提交到代码仓库** — 使用 `.gitignore` 排除 `.env`、`*.txt`、`credentials.*`
+- [ ] **使用最小权限原则** — 凭证文件设为 `600` 权限（仅 owner 可读写）
+- [ ] **生产环境用 Secrets Manager** — 如 Kubernetes Secrets、Vault、云厂商 KMS 等
+- [ ] **定期轮换密钥** — 在企业微信管理后台重新生成 secret
+- [ ] **不要在日志中打印密钥** — SDK 已内置 `maskSecret()` 脱敏处理
+
 ## 配置项
 
 ```go
 wecom.Options{
-    BotID:                "REQUIRED",           // 机器人 ID
-    Secret:               "REQUIRED",           // 长连接密钥
+    // 必填：机器人凭证（二选一）
+    BotID:                "REQUIRED",           // 直接赋值或环境变量
+    Secret:               "REQUIRED",           // 直接赋值或环境变量
+    BotIDFile:            "/etc/wecom/bot_id.txt",   // 从文件读取（推荐）
+    SecretFile:           "/etc/wecom/secret.txt",   // 从文件读取（推荐）
+
     WSURL:                "wss://...",           // 默认: wss://openws.work.weixin.qq.com
     HeartbeatInterval:    30 * time.Second,      // 心跳间隔
     ReconnectBaseDelay:   1 * time.Second,       // 重连基础延迟
     ReconnectMaxDelay:    30 * time.Second,      // 重连最大延迟
     MaxReconnectAttempts: 10,                    // 最大重连次数 (-1 = 无限)
     RequestTimeout:       10 * time.Second,      // 帧级写超时
-    Logger:               wecom.NewDefaultLogger(), // 自定义日志
+    Logger:               myLogger,              // 自定义日志（默认 stderr）
 }
 ```
+
+> `NewClient()` 返回 `(*Client, error)` — 使用 `SecretFile` / `BotIDFile` 时如果文件读取失败会返回 error。
 
 ## API 速查
 
@@ -207,13 +275,15 @@ client.Reply(frame, &wecom.ReplyBody{
 ```
 wecom-aibot-go-sdk/
 ├── types.go       # 所有数据结构 & 常量
-├── options.go     # 配置项 & 默认值
+├── options.go     # 配置项 & 默认值 & 凭证加载 & 脱敏工具
 ├── logger.go      # Logger 接口 & 默认实现
 ├── event.go       # 事件总线 (EventEmitter)
 ├── client.go      # 核心客户端 (连接/认证/心跳/分发/回复)
+├── stream.go      # StreamSession (流式消息防超时)
 ├── media.go       # 文件上传/下载/AES 解密
 ├── example/
 │   └── main.go    # 完整示例
+├── .gitignore     # 敏感文件排除规则
 ├── go.mod
 └── README.md
 ```
@@ -222,7 +292,7 @@ wecom-aibot-go-sdk/
 
 | Python SDK | Go SDK |
 |------------|--------|
-| `WSClient(options)` | `wecom.NewClient(opts)` |
+| `WSClient(options)` | `wecom.NewClient(opts)` → `(*Client, error)` |
 | `@ws_client.on('message.text')` | `client.On("message.text", handler)` |
 | `ws_client.reply_stream(frame, ...)` | `client.ReplyStream(frame, ...)` |
 | `ws_client.reply_template_card(frame, ...)` | `client.ReplyTemplateCard(frame, ...)` |
@@ -235,7 +305,7 @@ wecom-aibot-go-sdk/
 
 - **连接限制**：每个机器人同时仅支持 1 个长连接，新连接会踢掉旧连接
 - **频率限制**：30 条/分钟，1000 条/小时（单个会话）
-- **流式消息**：首次发送后 10 分钟内必须结束（`finish=true`）
+- **流式消息**：首次发送后 10 分钟内必须结束（`finish=true`），SDK 提供 StreamSession 自动防护
 - **欢迎语 / 更新卡片**：收到事件后 5 秒内必须回复
 - **上传文件**：单分片 ≤ 512KB，总分片 ≤ 100，文件有效期 3 天
 
@@ -252,16 +322,17 @@ type Logger interface {
 }
 
 // 使用 zap / slog / logrus 适配
-client := wecom.NewClient(wecom.Options{
+client, _ := wecom.NewClient(wecom.Options{
     Logger: myZapAdapter,
-    // ...
 })
 
 // 禁用日志
-client := wecom.NewClient(wecom.Options{
+client, _ := wecom.NewClient(wecom.Options{
     Logger: wecom.NopLogger(),
 })
 ```
+
+> 日志输出中的 secret 已内置脱敏处理（仅显示前4位和后4位）。
 
 ## 协议
 

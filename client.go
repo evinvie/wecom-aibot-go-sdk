@@ -38,13 +38,17 @@ type Client struct {
 }
 
 // NewClient 创建一个新的 SDK 客户端。
-func NewClient(opts Options) *Client {
-	opts = opts.withDefaults()
+// 如果使用 SecretFile / BotIDFile 读取凭证失败会返回 error。
+func NewClient(opts Options) (*Client, error) {
+	opts, err := opts.withDefaults()
+	if err != nil {
+		return nil, err
+	}
 	return &Client{
 		opts:    opts,
 		log:     opts.Logger,
 		emitter: NewEventEmitter(),
-	}
+	}, nil
 }
 
 // On 注册事件处理函数。事件名称常量定义在 event.go 中。
@@ -146,6 +150,7 @@ func (c *Client) connect(ctx context.Context) error {
 
 // authenticate 发送订阅请求完成身份认证。
 func (c *Client) authenticate() error {
+	c.log.Info("正在认证 (bot_id=%s, secret=%s)", c.opts.BotID, maskSecret(c.opts.Secret))
 	body := map[string]string{"bot_id": c.opts.BotID, "secret": c.opts.Secret}
 	resp, err := c.Send(CmdSubscribe, body)
 	if err != nil {
