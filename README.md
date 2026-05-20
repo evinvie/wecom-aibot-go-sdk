@@ -98,8 +98,8 @@ func main() {
 ```go
 // 禁止：在代码中硬编码密钥
 client := wecom.NewClient(wecom.Options{
-    BotID:  "aibuDpwikMdj_29wT2CeCpi6f2IHUOALxsp",
-    Secret: "A00labArIGW02gGtErzOPcCNSeU1Fpb3U4CPkP2F48b",
+    BotID:  "aibuDpwik******Cpi6f2IHUOALxsp",
+    Secret: "A00labAr*****pb3U4CPkP2F48b",
 })
 ```
 
